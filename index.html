@@ -16,7 +16,7 @@
     <header class="app-header">
       <div class="brand"><span class="brand-mark">R</span><span>Roomies</span></div>
       <p class="tagline">Split room expenses fairly with your roommates.</p>
-      <div class="session-bar"><span id="current-user-label">Signed in</span><button type="button" id="logout-btn" class="remove-btn">Log out</button></div>
+      <div class="session-bar"><span id="current-user-label">Signed in</span><button type="button" id="enable-notifications" class="notification-btn" hidden>Enable browser notifications</button><button type="button" id="logout-btn" class="remove-btn">Log out</button></div>
     </header>
 
     <main class="layout">
@@ -43,6 +43,24 @@
         <div id="invested-grid" class="invested-grid"></div>
       </section>
 
+      <section class="card wide">
+        <h2>Record settlement payment</h2>
+        <form id="settlement-form" class="stacked-form">
+          <p id="settlement-payer" class="empty-note"></p>
+          <div class="form-row">
+            <label>Pay to
+              <select id="settlement-recipient" required></select>
+            </label>
+            <label>Amount (SAR)
+              <input id="settlement-amount" type="number" step="0.01" min="0.01" placeholder="0.00" required />
+            </label>
+          </div>
+          <p id="settlement-limit" class="empty-note"></p>
+          <button class="primary-btn" type="submit">Record payment</button>
+          <p id="settlement-error" class="error-text" hidden></p>
+        </form>
+      </section>
+
       <section class="card wide" hidden>
         <h2>Roommates</h2>
         <ul id="roommate-list" class="chip-list"></ul>
@@ -56,6 +74,23 @@
           </form>
         </div>
         <p id="roommate-error" class="error-text" hidden></p>
+      </section>
+
+      <section id="user-management-card" class="card wide" hidden>
+        <h2>Create a user account</h2>
+        <form id="user-form" class="stacked-form">
+          <label>Household member
+            <select id="user-roommate" required></select>
+          </label>
+          <label>Username
+            <input id="user-username" type="text" autocomplete="off" placeholder="Choose a username" required maxlength="40" />
+          </label>
+          <label>Temporary password
+            <input id="user-password" type="password" autocomplete="new-password" placeholder="At least 8 characters" required minlength="8" maxlength="128" />
+          </label>
+          <button class="primary-btn" type="submit">Create user</button>
+          <p id="user-error" class="error-text" hidden></p>
+        </form>
       </section>
 
       <section class="card wide">
@@ -74,6 +109,16 @@
       </section>
 
       <section class="card wide">
+        <h2>Settlement history</h2>
+        <div class="table-wrap">
+          <table class="data-table" id="settlement-history-table">
+            <thead><tr><th>Date</th><th>Paid by</th><th>Paid to</th><th>Amount</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card wide">
         <h2>Expense history</h2>
         <div class="table-wrap">
           <table class="data-table" id="expense-table">
@@ -84,6 +129,7 @@
       </section>
     </main>
   </div>
+  <div id="app-notification" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="app.js"></script>
 </body>
 </html>

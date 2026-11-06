@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -65,6 +66,15 @@ def initialise_database():
                 roommate_id INTEGER NOT NULL REFERENCES roommates(id) ON DELETE CASCADE,
                 share_amount REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS settlement_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                paid_by INTEGER NOT NULL REFERENCES roommates(id),
+                paid_to INTEGER NOT NULL REFERENCES roommates(id),
+                amount REAL NOT NULL CHECK (amount > 0),
+                created_by INTEGER NOT NULL REFERENCES users(id),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         ''')
 
 
@@ -108,16 +118,24 @@ def compute_balances(database):
         'SELECT paid_by, SUM(amount) AS total FROM expenses GROUP BY paid_by')}
     share_totals = {row['roommate_id']: row['total'] for row in database.execute(
         'SELECT roommate_id, SUM(share_amount) AS total FROM expense_splits GROUP BY roommate_id')}
+    settled_paid = {row['paid_by']: row['total'] for row in database.execute(
+        'SELECT paid_by, SUM(amount) AS total FROM settlement_payments GROUP BY paid_by')}
+    settled_received = {row['paid_to']: row['total'] for row in database.execute(
+        'SELECT paid_to, SUM(amount) AS total FROM settlement_payments GROUP BY paid_to')}
     balances = []
     for roommate in roommates:
         paid = round(paid_totals.get(roommate['id'], 0.0), 2)
         share = round(share_totals.get(roommate['id'], 0.0), 2)
+        sent = round(settled_paid.get(roommate['id'], 0.0), 2)
+        received = round(settled_received.get(roommate['id'], 0.0), 2)
         balances.append({
             'id': roommate['id'],
             'name': roommate['name'],
             'paid': paid,
             'share': share,
-            'net': round(paid - share, 2),
+            'settled_paid': sent,
+            'settled_received': received,
+            'net': round(paid - share + sent - received, 2),
         })
     return balances
 
@@ -197,12 +215,21 @@ class RoommateHandler(SimpleHTTPRequestHandler):
                 })
             balances = compute_balances(database)
             settlements = simplify_settlements(balances)
+            settlement_payments = [dict(row) for row in database.execute('''
+                SELECT settlement_payments.id, settlement_payments.amount, settlement_payments.created_at,
+                    payer.name AS paid_by, payee.name AS paid_to
+                FROM settlement_payments
+                JOIN roommates AS payer ON payer.id = settlement_payments.paid_by
+                JOIN roommates AS payee ON payee.id = settlement_payments.paid_to
+                ORDER BY settlement_payments.id DESC
+            ''')]
         return self.send_json(200, {
             'me': public_user(session),
             'roommates': roommates,
             'expenses': expenses,
             'balances': balances,
             'settlements': settlements,
+            'settlement_payments': settlement_payments,
         })
 
     def do_POST(self):
@@ -210,28 +237,45 @@ class RoommateHandler(SimpleHTTPRequestHandler):
         try:
             payload = self.read_json()
 
-            if path == '/api/register':
-                username = normalise_username(payload.get('username'))
-                password = str(payload.get('password', ''))
-                if not NAME_PATTERN.match(username):
-                    return self.send_json(400, {'error': 'Enter a username using letters, numbers, spaces, - or _ (max 40 characters).'})
-                if len(password) < 6:
-                    return self.send_json(400, {'error': 'Password must be at least 6 characters.'})
+            if path == '/api/admin/import-local-users':
+                import_token = os.environ.get('ROOMMATE_IMPORT_TOKEN', '')
+                auth_header = self.headers.get('Authorization', '')
+                supplied_token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
+                if not import_token or not secrets.compare_digest(supplied_token, import_token):
+                    return self.send_json(403, {'error': 'User import is not authorized.'})
+                users = payload.get('users')
+                if not isinstance(users, list) or not users or len(users) > 50:
+                    return self.send_json(400, {'error': 'A valid list of local users is required.'})
+                usernames = set()
+                for user in users:
+                    username = normalise_username(user.get('username'))
+                    roommate_name = normalise_name(user.get('roommate_name'))
+                    password_digest = str(user.get('password_hash', ''))
+                    password_salt = str(user.get('password_salt', ''))
+                    if not NAME_PATTERN.match(username) or not roommate_name:
+                        return self.send_json(400, {'error': 'An imported username or roommate name is invalid.'})
+                    if not re.fullmatch(r'[0-9a-f]{64}', password_digest) or not re.fullmatch(r'[0-9a-f]{32}', password_salt):
+                        return self.send_json(400, {'error': 'An imported password hash is invalid.'})
+                    if username in usernames:
+                        return self.send_json(400, {'error': 'The import contains duplicate usernames.'})
+                    usernames.add(username)
                 with connection() as database:
-                    if database.execute('SELECT 1 FROM users WHERE username = ?', (username,)).fetchone():
-                        return self.send_json(409, {'error': 'That username is already taken.'})
-                    is_first_user = database.execute('SELECT 1 FROM users LIMIT 1').fetchone() is None
-                    existing_roommate = database.execute('SELECT id FROM roommates WHERE name = ?', (username,)).fetchone()
-                    roommate_id = existing_roommate['id'] if existing_roommate else database.execute(
-                        'INSERT INTO roommates (name) VALUES (?)', (username,)).lastrowid
-                    salt, digest = password_hash(password)
-                    cursor = database.execute(
-                        'INSERT INTO users (username, password_hash, password_salt, roommate_id, is_admin) VALUES (?, ?, ?, ?, ?)',
-                        (username, digest, salt, roommate_id, 1 if is_first_user else 0),
-                    )
-                    user = database.execute('SELECT * FROM users WHERE id = ?', (cursor.lastrowid,)).fetchone()
-                token = create_session(user)
-                return self.send_json(201, {'token': token, 'user': {'username': user['username'], 'is_admin': bool(user['is_admin'])}})
+                    if database.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+                        return self.send_json(409, {'error': 'Render already has user accounts; no data was changed.'})
+                    for user in users:
+                        username = normalise_username(user['username'])
+                        roommate_name = normalise_name(user['roommate_name'])
+                        roommate = database.execute('SELECT id FROM roommates WHERE name = ?', (roommate_name,)).fetchone()
+                        roommate_id = roommate['id'] if roommate else database.execute(
+                            'INSERT INTO roommates (name) VALUES (?)', (roommate_name,)).lastrowid
+                        database.execute(
+                            'INSERT INTO users (username, password_hash, password_salt, roommate_id, is_admin) VALUES (?, ?, ?, ?, ?)',
+                            (username, user['password_hash'], user['password_salt'], roommate_id, int(bool(user.get('is_admin')))),
+                        )
+                return self.send_json(201, {'imported': len(users)})
+
+            if path == '/api/register':
+                return self.send_json(403, {'error': 'Account registration is closed. Contact the house admin.'})
 
             if path == '/api/login':
                 username = normalise_username(payload.get('username'))
@@ -255,6 +299,43 @@ class RoommateHandler(SimpleHTTPRequestHandler):
             session = self.current_session()
             if not session:
                 return self.send_json(401, {'error': 'Please sign in again.'})
+
+            if path == '/api/admin/clear-transactions':
+                if not session['is_admin']:
+                    return self.send_json(403, {'error': 'Only the house admin can clear transaction data.'})
+                if payload.get('confirm') is not True:
+                    return self.send_json(400, {'error': 'Explicit confirmation is required.'})
+                with connection() as database:
+                    expenses = database.execute('SELECT COUNT(*) FROM expenses').fetchone()[0]
+                    settlements = database.execute('SELECT COUNT(*) FROM settlement_payments').fetchone()[0]
+                    database.execute('DELETE FROM expense_splits')
+                    database.execute('DELETE FROM expenses')
+                    database.execute('DELETE FROM settlement_payments')
+                return self.send_json(200, {'cleared': {'expenses': expenses, 'settlements': settlements}})
+
+            if path == '/api/admin/users':
+                if not session['is_admin']:
+                    return self.send_json(403, {'error': 'Only the house admin can create user accounts.'})
+                username = normalise_username(payload.get('username'))
+                password = payload.get('password')
+                roommate_name = normalise_name(payload.get('roommate_name'))
+                if not NAME_PATTERN.fullmatch(username):
+                    return self.send_json(400, {'error': 'Enter a username using letters, numbers, spaces, - or _ (max 40 characters).'})
+                if not isinstance(password, str) or not 8 <= len(password) <= 128:
+                    return self.send_json(400, {'error': 'Password must be between 8 and 128 characters.'})
+                with connection() as database:
+                    roommate = database.execute('SELECT id FROM roommates WHERE name = ?', (roommate_name,)).fetchone()
+                    if not roommate:
+                        return self.send_json(404, {'error': 'Select an existing household member.'})
+                    salt, digest = password_hash(password)
+                    created = database.execute(
+                        'INSERT INTO users (username, password_hash, password_salt, roommate_id) VALUES (?, ?, ?, ?) '
+                        'ON CONFLICT(username) DO NOTHING',
+                        (username, digest, salt, roommate['id']),
+                    )
+                    if not created.rowcount:
+                        return self.send_json(409, {'error': 'That username is already in use.'})
+                return self.send_json(201, {'created': True, 'username': username})
 
             if path == '/api/roommates':
                 if not session['is_admin']:
@@ -319,6 +400,38 @@ class RoommateHandler(SimpleHTTPRequestHandler):
                             'INSERT INTO expense_splits (expense_id, roommate_id, share_amount) VALUES (?, ?, ?)',
                             (expense_id, participant['id'], round(share_amount, 2)),
                         )
+                return self.send_json(201, {'saved': True})
+
+            if path == '/api/settlements':
+                recipient_name = normalise_name(payload.get('to'))
+                try:
+                    amount = round(float(payload.get('amount')), 2)
+                except (TypeError, ValueError):
+                    return self.send_json(400, {'error': 'Enter a valid settlement amount.'})
+                if not math.isfinite(amount) or amount <= 0:
+                    return self.send_json(400, {'error': 'Settlement amount must be greater than zero.'})
+                if not recipient_name:
+                    return self.send_json(400, {'error': 'Select who you paid.'})
+                with connection() as database:
+                    recipient = database.execute('SELECT id FROM roommates WHERE name = ?', (recipient_name,)).fetchone()
+                    if not recipient:
+                        return self.send_json(404, {'error': 'Recipient roommate was not found.'})
+                    if recipient['id'] == session['roommate_id']:
+                        return self.send_json(400, {'error': 'You cannot record a payment to yourself.'})
+                    balances = {row['id']: row for row in compute_balances(database)}
+                    payer_balance = balances.get(session['roommate_id'])
+                    recipient_balance = balances.get(recipient['id'])
+                    if not payer_balance or payer_balance['net'] >= -0.005:
+                        return self.send_json(400, {'error': 'You do not currently owe a settlement.'})
+                    if not recipient_balance or recipient_balance['net'] <= 0.005:
+                        return self.send_json(400, {'error': 'That roommate is not currently owed money.'})
+                    maximum = round(min(-payer_balance['net'], recipient_balance['net']), 2)
+                    if amount > maximum + 0.005:
+                        return self.send_json(400, {'error': f'Maximum payment to this roommate is SAR {maximum:.2f}.'})
+                    database.execute(
+                        'INSERT INTO settlement_payments (paid_by, paid_to, amount, created_by) VALUES (?, ?, ?, ?)',
+                        (session['roommate_id'], recipient['id'], amount, session['user_id']),
+                    )
                 return self.send_json(201, {'saved': True})
 
             if path == '/api/expenses/delete':
