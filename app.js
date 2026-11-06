@@ -135,6 +135,13 @@ async function loadData() {
 	lastDataSignature = signature;
 	latestBalances = data.balances;
 	renderRoommates(data.roommates);
+	if (sessionStorage.getItem('roomies-open-user-form') === '1') {
+		sessionStorage.removeItem('roomies-open-user-form');
+		if (isAdmin()) {
+			userManagementCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			userRoommateSelect.focus({ preventScroll: true });
+		}
+	}
 	renderInvested(data.balances);
 	renderBalances(data.balances);
 	renderSettlements(data.settlements, data.balances, data.settlement_payments);
